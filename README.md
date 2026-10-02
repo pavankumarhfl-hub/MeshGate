@@ -1,162 +1,222 @@
 # MeshGate
 
-**A reliability-focused HTTP API gateway written in Go.**
+**Reliability-focused HTTP API gateway written in Go.**
 
-MeshGate is an engineering project for studying how gateways behave when downstream services are slow, unavailable, overloaded, or returning errors. The project emphasizes explicit failure handling, bounded retries, circuit breaking, concurrency safety, testing, and measurable behavior.
+MeshGate is an engineering project for studying the failure modes and control mechanisms that sit between clients and unreliable or overloaded upstream services.
 
-> MeshGate is an engineering project, not a claim of production readiness. Capabilities are documented according to what is implemented and tested.
+[![CI](https://github.com/pavankumarhfl-hub/MeshGate/actions/workflows/ci.yml/badge.svg)](https://github.com/pavankumarhfl-hub/MeshGate/actions/workflows/ci.yml)
+
+> **Status:** Early engineering build. It is not presented as production-ready software.
 
 ## Why this project exists
 
-A reverse proxy that forwards HTTP requests is easy to build. A useful gateway must also define what happens when dependencies fail.
+A reverse proxy is easy to demonstrate. A useful gateway has to make deliberate decisions about timeouts, retries, overload, request limits, partial failure, and shutdown behavior.
 
-MeshGate is being developed around those questions:
-
-- How long should a request wait?
-- Which failures are safe to retry?
-- How do retries avoid amplifying an outage?
-- When should a dependency be temporarily isolated?
-- How should concurrent clients share gateway resources?
-- How do we test failure paths rather than only happy paths?
-- Which performance claims can actually be supported by measurements?
+MeshGate is being built around those engineering questions rather than around a long list of framework features.
 
 ## Current capabilities
 
-- HTTP routing to configured upstreams
-- Bounded outbound request timeouts
-- Bounded retries for transport and upstream 5xx failures
-- Jittered retry backoff
-- Process-local per-client rate limiting
-- Circuit breaker with closed/open/half-open states
+- HTTP request routing to configured upstreams
+- Per-process rate limiting
+- Upstream request timeout
+- Overall request deadline
+- Maximum request-body size
+- Bounded retries with jitter for retry-safe HTTP methods
+- Circuit breaker with a single half-open probe
 - Health and readiness endpoints
-- JSON route listing endpoint
-- Unit and integration tests
-- Go race-detector CI
-- Minimal non-root production container
+- Route inspection endpoint
+- Graceful shutdown on SIGINT/SIGTERM
+- Race-detector CI
+- `go vet` CI
+- Non-root distroless container image
+- Unit and integration-style tests around failure behavior
 
 ## Architecture
 
 ```text
-                    +-------------------+
-Client ------------>|     MeshGate      |
-                    |                   |
-                    | Rate Limiter      |
-                    | Route Lookup      |
-                    |       |           |
-                    |       v           |
-                    |   HTTP Proxy      |
-                    |   /  |  \         |
-                    | timeout retries   |
-                    |        |          |
-                    |  circuit breaker  |
-                    +--------|----------+
-                             |
-                             v
-                       Upstream service
+                    ┌──────────────────────┐
+                    │       Client         │
+                    └──────────┬───────────┘
+                               │ HTTP
+                               ▼
+                    ┌──────────────────────┐
+                    │      MeshGate        │
+                    │                      │
+                    │  deadline / limits  │
+                    │  rate limiting      │
+                    │  route selection    │
+                    │  retry policy       │
+                    │  circuit breaker    │
+                    └──────────┬───────────┘
+                               │
+                         HTTP / upstream
+                               ▼
+                    ┌──────────────────────┐
+                    │   Upstream service   │
+                    └──────────────────────┘
 ```
 
-See [`docs/architecture.md`](docs/architecture.md) for the current component boundaries and [`docs/reliability.md`](docs/reliability.md) for failure semantics.
+See [`docs/architecture.md`](docs/architecture.md) for component boundaries and [`docs/reliability.md`](docs/reliability.md) for failure semantics.
 
-## Run locally
+## Reliability model
+
+### Timeouts
+
+MeshGate has separate limits for HTTP header parsing, overall request processing, and upstream communication. The goal is to prevent a slow dependency from consuming a gateway worker indefinitely.
+
+### Retries
+
+Retries are deliberately bounded and use jittered backoff. By default, retries are enabled only for methods commonly treated as retry-safe: `GET`, `HEAD`, `OPTIONS`, `PUT`, `DELETE`, and `TRACE`.
+
+`POST` is not automatically retried because repeating a non-idempotent operation can duplicate side effects.
+
+### Circuit breaker
+
+Repeated upstream failures open the circuit. After the cooldown, one request is admitted as a half-open probe; concurrent requests remain rejected until that probe succeeds or fails.
+
+### Resource limits
+
+Request bodies are bounded before the proxy attempts to read them. This prevents an otherwise simple retry mechanism from turning request buffering into an unbounded memory risk.
+
+## Configuration
+
+MeshGate is configured through environment variables for the current single-route deployment model:
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `MESHGATE_ADDR` | `:8080` | Listen address |
+| `MESHGATE_REQUEST_TIMEOUT` | `10s` | Overall request deadline |
+| `MESHGATE_UPSTREAM_TIMEOUT` | `3s` | Upstream client timeout |
+| `MESHGATE_MAX_RETRIES` | `2` | Maximum retry attempts after the first request |
+| `MESHGATE_RATE_LIMIT` | `100` | Requests per fixed one-second window per key |
+| `MESHGATE_BURST` | `100` | Burst ceiling for the local limiter |
+| `MESHGATE_MAX_BODY_BYTES` | `1048576` | Maximum request body size |
+| `MESHGATE_ROUTE_PATH` | unset | Gateway route path, e.g. `/api` |
+| `MESHGATE_ROUTE_TARGET` | unset | Upstream URL, e.g. `http://127.0.0.1:9000` |
+
+Example:
 
 ```bash
+MESHGATE_ROUTE_PATH=/api \
+MESHGATE_ROUTE_TARGET=http://127.0.0.1:9000 \
 go run ./cmd/meshgate
 ```
 
-The default listener is `:8080`.
-
-```bash
-curl http://localhost:8080/healthz
-curl http://localhost:8080/readyz
-curl http://localhost:8080/routes
-```
-
-The current baseline registers `/example` against `http://127.0.0.1:9000`. A later configuration layer will replace this development-only default with explicit route configuration.
-
-## Test
+## Local development
 
 ```bash
 go test ./...
-go test -race ./...
 go vet ./...
+go test -race ./...
+go run ./cmd/meshgate
 ```
 
-CI runs tests, `go vet`, and the race detector across supported Go versions.
+With Docker:
 
-## Engineering decisions
+```bash
+docker build -t meshgate .
+docker run --rm -p 8080:8080 \
+  -e MESHGATE_ROUTE_PATH=/api \
+  -e MESHGATE_ROUTE_TARGET=http://host.docker.internal:9000 \
+  meshgate
+```
 
-### Go standard library first
+## Testing strategy
 
-The initial implementation deliberately minimizes dependencies. HTTP behavior, synchronization and failure handling remain visible in the source and easy to test.
+The test suite is intended to exercise failure behavior, not just successful forwarding.
 
-### Bounded retries
+Current coverage includes:
 
-Retries are limited because an unhealthy upstream can otherwise turn a small failure into a larger traffic storm. Jitter reduces synchronized retry timing.
+- successful request forwarding
+- upstream 5xx retry behavior
+- retry safety for `POST`
+- rate-limit rejection
+- circuit opening and recovery
+- race-detector coverage in CI
 
-### Circuit breaking
+The benchmark harness is intentionally separate from functional tests. See [`benchmarks/README.md`](benchmarks/README.md).
 
-Repeated failures should eventually fail fast instead of continuously consuming gateway and upstream resources.
+## Performance evidence
 
-### Process-local rate limiting
+No throughput or latency claim is published yet.
 
-The first implementation keeps state in memory to make semantics deterministic and dependency-free. This is intentionally **not** a distributed rate limiter.
+The project will publish benchmark results only after the request path and workload definitions stabilize. Reports will include commit SHA, Go version, hardware/OS, concurrency, request size, upstream behavior, throughput, p50/p95/p99 latency, error rate, retries, and breaker transitions.
 
-## Performance
+This avoids presenting a single benchmark number without its workload and environment.
 
-No throughput or latency numbers are published yet. Benchmarking will be added only after the request path and failure semantics stabilize. Results will include workload, concurrency, hardware/runtime information, and methodology so they can be reproduced.
+## Security posture
+
+Security is treated as an engineering constraint, but this repository is **not** claiming production security readiness.
+
+Current focus areas include request-size limits, bounded retries, upstream URL validation, non-root container execution, least-privilege CI permissions, and avoiding automatic retries of non-idempotent methods.
+
+See [`SECURITY.md`](SECURITY.md) for the current disclosure and hardening scope.
+
+## Deliberate limitations
+
+The current build does **not** yet provide:
+
+- distributed rate limiting
+- service discovery
+- weighted or adaptive load balancing
+- Prometheus metrics
+- OpenTelemetry tracing
+- dynamic configuration reloads
+- authentication/authorization middleware
+- multi-route configuration files
+- persistent configuration state
+- production deployment manifests
+
+These are explicit next steps, not implied capabilities.
 
 ## Roadmap
 
-### Phase 1 — reliability baseline
+### Phase 1 — Reliability baseline
 
-- [x] HTTP gateway runtime
-- [x] bounded timeouts
-- [x] retries with jitter
+- [x] HTTP proxying
+- [x] timeouts and deadlines
+- [x] bounded retries with jitter
 - [x] circuit breaker
-- [x] process-local rate limiting
-- [x] health/readiness endpoints
-- [x] unit/integration tests
-- [x] race-detector CI
-- [x] container image
+- [x] request-size limits
+- [x] local rate limiting
+- [x] graceful shutdown
+- [x] CI with race detection
 
-### Phase 2 — gateway engineering
+### Phase 2 — Gateway engineering
 
-- [ ] explicit YAML/JSON configuration
-- [ ] multiple upstreams per route
-- [ ] round-robin and least-connections load balancing
-- [ ] active/passive health checks
-- [ ] graceful shutdown and connection draining
-- [ ] request/response size limits
-- [ ] structured access logging
+- [ ] multiple route configuration
+- [ ] health-aware load balancing
+- [ ] upstream connection-pool controls
+- [ ] deterministic routing tests
+- [ ] structured request IDs
 
-### Phase 3 — observability and security
+### Phase 3 — Observability and security
 
-- [ ] Prometheus-compatible metrics
-- [ ] OpenTelemetry tracing
-- [ ] request IDs and correlation
-- [ ] authentication middleware interface
-- [ ] security headers and policy documentation
-- [ ] audit events
+- [ ] Prometheus metrics
+- [ ] OpenTelemetry traces
+- [ ] authentication middleware
+- [ ] upstream allow-list policy
+- [ ] security-focused integration tests
+- [ ] failure-injection scenarios
 
-### Phase 4 — evidence
+### Phase 4 — Evidence
 
-- [ ] concurrency benchmarks
-- [ ] latency distributions
-- [ ] retry/circuit-breaker failure experiments
-- [ ] load-shedding experiments
-- [ ] documented capacity limits
+- [ ] concurrency benchmark suite
+- [ ] latency distributions under load
+- [ ] controlled upstream failure experiments
+- [ ] capacity and saturation analysis
 - [ ] reproducible benchmark reports
 
-## Security
+## Engineering decisions
 
-Security is treated as an engineering constraint. The project will document trust boundaries, authentication assumptions, header handling, resource limits, dependency policy and abuse cases before claiming production readiness.
+Important decisions are documented rather than hidden behind implementation details:
 
-Please see the repository's security policy when it is added.
+- [`docs/architecture.md`](docs/architecture.md)
+- [`docs/reliability.md`](docs/reliability.md)
+- [`benchmarks/README.md`](benchmarks/README.md)
 
-## Project status
-
-**Early engineering build.** The repository is intentionally incomplete. Missing production features are tracked explicitly instead of being presented as implemented capabilities.
+The central rule is simple: **do not claim performance, scale, security, or reliability characteristics that have not been measured or tested.**
 
 ## License
 
-MIT
+MIT — see [`LICENSE`](LICENSE).
