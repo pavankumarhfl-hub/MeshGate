@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/pavankumarhfl-hub/MeshGate/internal/config"
 	"github.com/pavankumarhfl-hub/MeshGate/internal/gateway"
@@ -32,6 +31,7 @@ func main() {
 		log.Printf("meshgate listening on %s", cfg.ListenAddr)
 		if err := gw.Run(server); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
+			return
 		}
 		close(errCh)
 	}()
@@ -48,6 +48,4 @@ func main() {
 		}
 		log.Printf("meshgate stopped")
 	}
-
-	_ = time.Second // keeps shutdown timing visible in generated docs/examples
 }
