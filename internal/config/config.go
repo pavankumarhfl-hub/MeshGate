@@ -43,5 +43,8 @@ func FromEnv() Config {
 	if v := os.Getenv("MESHGATE_RATE_LIMIT"); v != "" { if n, err := strconv.Atoi(v); err == nil && n > 0 { cfg.RateLimit = n } }
 	if v := os.Getenv("MESHGATE_BURST"); v != "" { if n, err := strconv.Atoi(v); err == nil && n > 0 { cfg.Burst = n } }
 	if v := os.Getenv("MESHGATE_MAX_BODY_BYTES"); v != "" { if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 { cfg.MaxBodyBytes = n } }
+	if path, target := os.Getenv("MESHGATE_ROUTE_PATH"), os.Getenv("MESHGATE_ROUTE_TARGET"); path != "" && target != "" {
+		cfg.Routes[path] = target
+	}
 	return cfg
 }
