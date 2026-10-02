@@ -14,31 +14,59 @@ import (
 )
 
 type Proxy struct {
-	client *http.Client
-	upstream *url.URL
-	breaker *breaker.Breaker
+	client     *http.Client
+	upstream   *url.URL
+	breaker    *breaker.Breaker
 	maxRetries int
 }
 
 func New(target string, timeout time.Duration, retries int) (*Proxy, error) {
 	u, err := url.Parse(target)
 	if err != nil { return nil, err }
-	return &Proxy{client: &http.Client{Timeout: timeout}, upstream: u, breaker: breaker.New(5, 5*time.Second), maxRetries: retries}, nil
+	if u.Scheme == "" || u.Host == "" { return nil, errors.New("upstream target must include scheme and host") }
+	return &Proxy{
+		client: &http.Client{Timeout: timeout},
+		upstream: u,
+		breaker: breaker.New(5, 5*time.Second),
+		maxRetries: retries,
+	}, nil
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if err := p.breaker.Allow(); err != nil { http.Error(w, err.Error(), http.StatusServiceUnavailable); return }
+	if err := p.breaker.Allow(); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+
 	body, err := io.ReadAll(r.Body)
-	if err != nil { http.Error(w, "request body read failed", http.StatusBadRequest); return }
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "request body read failed", http.StatusBadRequest)
+		return
+	}
+
+	retries := p.maxRetries
+	if !retrySafe(r.Method) { retries = 0 }
+
 	var last error
-	for attempt := 0; attempt <= p.maxRetries; attempt++ {
-		if attempt > 0 { time.Sleep(time.Duration(25*(1<<min(attempt, 6)))*time.Millisecond + time.Duration(rand.Intn(25))*time.Millisecond) }
+	for attempt := 0; attempt <= retries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(25*(1<<min(attempt, 6)))*time.Millisecond + time.Duration(rand.Intn(25))*time.Millisecond)
+		}
 		err = p.forward(r.Context(), w, r, body)
-		if err == nil { p.breaker.Success(); return }
+		if err == nil {
+			p.breaker.Success()
+			return
+		}
 		last = err
 		p.breaker.Failure()
 		if !retryable(err) { break }
 	}
+
 	if last == nil { last = errors.New("unknown upstream failure") }
 	http.Error(w, "upstream unavailable: "+last.Error(), http.StatusBadGateway)
 }
@@ -60,8 +88,28 @@ func (p *Proxy) forward(ctx context.Context, w http.ResponseWriter, r *http.Requ
 	return err
 }
 
-type upstreamStatus struct { code int }
+type upstreamStatus struct{ code int }
 func (e *upstreamStatus) Error() string { return http.StatusText(e.code) }
-func retryable(err error) bool { var e *upstreamStatus; if errors.As(err, &e) { return e.code >= 500 }; return true }
-func joinPath(a,b string) string { if a=="/" { return b }; if b=="/" { return a }; return a+"/"+b }
-func min(a,b int) int { if a<b{return a}; return b }
+
+func retrySafe(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodPut, http.MethodDelete, http.MethodTrace:
+		return true
+	default:
+		return false
+	}
+}
+
+func retryable(err error) bool {
+	var e *upstreamStatus
+	if errors.As(err, &e) { return e.code >= 500 }
+	return true
+}
+
+func joinPath(a, b string) string {
+	if a == "/" { return b }
+	if b == "/" { return a }
+	return a + "/" + b
+}
+
+func min(a, b int) int { if a < b { return a }; return b }
