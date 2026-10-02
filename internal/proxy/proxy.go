@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -13,10 +14,10 @@ import (
 )
 
 type Proxy struct {
-	client      *http.Client
-	upstream    *url.URL
-	breaker     *breaker.Breaker
-	maxRetries  int
+	client *http.Client
+	upstream *url.URL
+	breaker *breaker.Breaker
+	maxRetries int
 }
 
 func New(target string, timeout time.Duration, retries int) (*Proxy, error) {
@@ -27,10 +28,12 @@ func New(target string, timeout time.Duration, retries int) (*Proxy, error) {
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := p.breaker.Allow(); err != nil { http.Error(w, err.Error(), http.StatusServiceUnavailable); return }
+	body, err := io.ReadAll(r.Body)
+	if err != nil { http.Error(w, "request body read failed", http.StatusBadRequest); return }
 	var last error
 	for attempt := 0; attempt <= p.maxRetries; attempt++ {
 		if attempt > 0 { time.Sleep(time.Duration(25*(1<<min(attempt, 6)))*time.Millisecond + time.Duration(rand.Intn(25))*time.Millisecond) }
-		err := p.forward(r.Context(), w, r)
+		err = p.forward(r.Context(), w, r, body)
 		if err == nil { p.breaker.Success(); return }
 		last = err
 		p.breaker.Failure()
@@ -40,11 +43,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "upstream unavailable: "+last.Error(), http.StatusBadGateway)
 }
 
-func (p *Proxy) forward(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
+func (p *Proxy) forward(ctx context.Context, w http.ResponseWriter, r *http.Request, body []byte) error {
 	u := *p.upstream
 	u.Path = joinPath(u.Path, r.URL.Path)
 	u.RawQuery = r.URL.RawQuery
-	req, err := http.NewRequestWithContext(ctx, r.Method, u.String(), r.Body)
+	req, err := http.NewRequestWithContext(ctx, r.Method, u.String(), bytes.NewReader(body))
 	if err != nil { return err }
 	req.Header = r.Header.Clone()
 	resp, err := p.client.Do(req)
