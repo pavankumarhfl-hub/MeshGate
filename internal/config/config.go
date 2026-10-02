@@ -1,15 +1,22 @@
 package config
 
-import "time"
+import (
+	"os"
+	"strconv"
+	"time"
+)
 
 type Config struct {
-	ListenAddr       string
+	ListenAddr        string
 	ReadHeaderTimeout time.Duration
-	RequestTimeout   time.Duration
-	UpstreamTimeout  time.Duration
-	MaxRetries       int
-	RateLimit        int
-	Burst            int
+	RequestTimeout    time.Duration
+	UpstreamTimeout   time.Duration
+	MaxRetries        int
+	RateLimit         int
+	Burst             int
+	MaxBodyBytes      int64
+	ShutdownTimeout   time.Duration
+	Routes            map[string]string
 }
 
 func Default() Config {
@@ -21,5 +28,20 @@ func Default() Config {
 		MaxRetries:        2,
 		RateLimit:         100,
 		Burst:             100,
+		MaxBodyBytes:      1 << 20,
+		ShutdownTimeout:   10 * time.Second,
+		Routes:            map[string]string{},
 	}
+}
+
+func FromEnv() Config {
+	cfg := Default()
+	if v := os.Getenv("MESHGATE_ADDR"); v != "" { cfg.ListenAddr = v }
+	if v := os.Getenv("MESHGATE_UPSTREAM_TIMEOUT"); v != "" { if d, err := time.ParseDuration(v); err == nil { cfg.UpstreamTimeout = d } }
+	if v := os.Getenv("MESHGATE_REQUEST_TIMEOUT"); v != "" { if d, err := time.ParseDuration(v); err == nil { cfg.RequestTimeout = d } }
+	if v := os.Getenv("MESHGATE_MAX_RETRIES"); v != "" { if n, err := strconv.Atoi(v); err == nil && n >= 0 { cfg.MaxRetries = n } }
+	if v := os.Getenv("MESHGATE_RATE_LIMIT"); v != "" { if n, err := strconv.Atoi(v); err == nil && n > 0 { cfg.RateLimit = n } }
+	if v := os.Getenv("MESHGATE_BURST"); v != "" { if n, err := strconv.Atoi(v); err == nil && n > 0 { cfg.Burst = n } }
+	if v := os.Getenv("MESHGATE_MAX_BODY_BYTES"); v != "" { if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 { cfg.MaxBodyBytes = n } }
+	return cfg
 }
